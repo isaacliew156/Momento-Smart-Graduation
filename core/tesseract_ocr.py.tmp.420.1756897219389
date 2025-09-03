@@ -1,0 +1,1598 @@
+import cv2
+import numpy as np
+import pytesseract
+import re
+import os
+from PIL import Image
+import streamlit as st
+from datetime import datetime
+
+class TesseractOCR:
+    def __init__(self, tesseract_path=None):
+        """Initialize Tesseract OCR for student card scanning"""
+        self.tesseract_available = False
+        self.tesseract_version = None
+        self.init_error = None
+        
+        # Set Tesseract path based on OS
+        if tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        else:
+            if os.name == 'nt':  # Windows
+                possible_paths = [
+                    r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                    r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                    r'C:\Tesseract-OCR\tesseract.exe'
+                ]
+                
+                tesseract_found = False
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        pytesseract.pytesseract.tesseract_cmd = path
+                        tesseract_found = True
+                        print(f"✅ Found Tesseract at: {path}")
+                        break
+                
+                if not tesseract_found:
+                    self.init_error = f"Tesseract not found in common Windows locations: {possible_paths}"
+            # Linux/Mac will use system PATH
+        
+        # Test Tesseract installation
+        try:
+            self.tesseract_version = pytesseract.get_tesseract_version()
+            self.tesseract_available = True
+            print(f"✅ Tesseract OCR initialized successfully! Version: {self.tesseract_version}")
+        except Exception as e:
+            self.init_error = f"Tesseract installation test failed: {str(e)}"
+            print(f"❌ Tesseract initialization failed: {self.init_error}")
+        
+        # ID pattern for TARUMT - flexible format to support multiple years and program codes
+        # Format: YYW[2-3 letters][4-5 digits] where YY can be 19-25, W followed by 2-3 letters, then 4-5 digits
+        self.id_pattern = re.compile(r'(?:19|2[0-5])W[A-Z]{2,3}\d{4,5}')
+        
+        # Card dimensions ratio
+        self.card_ratio = 85.6 / 54.0
+    
+    def get_diagnostic_info(self):
+        """Get diagnostic information about Tesseract installation"""
+        info = {
+            'tesseract_available': self.tesseract_available,
+            'tesseract_version': str(self.tesseract_version) if self.tesseract_version else None,
+            'tesseract_cmd': pytesseract.pytesseract.tesseract_cmd,
+            'init_error': self.init_error,
+            'os_type': os.name
+        }
+        return info
+    
+    def calculate_sharpness(self, image):
+        """Calculate image sharpness using Laplacian variance"""
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            return cv2.Laplacian(gray, cv2.CV_64F).var()
+        except (AttributeError, cv2.error) as e:
+            print(f"Sharpness calculation error: {e}")
+            return 0
+    
+    def enhance_image(self, image):
+        """Apply adaptive CLAHE enhancement for better OCR"""
+        try:
+            # Convert to LAB color space
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            
+            # Calculate image brightness for adaptive parameters
+            brightness = np.mean(l)
+            
+            # Adaptive CLAHE parameters based on brightness
+            if brightness < 50:  # Very dark image
+                clip_limit = 4.0
+                grid_size = (4, 4)
+                print(f"📊 Very dark image detected (brightness: {brightness:.1f}), using aggressive enhancement")
+            elif brightness < 100:  # Dark image
+                clip_limit = 3.0
+                grid_size = (6, 6)
+                print(f"📊 Dark image detected (brightness: {brightness:.1f}), using moderate enhancement")
+            elif brightness > 200:  # Very bright image
+                clip_limit = 1.5
+                grid_size = (10, 10)
+                print(f"📊 Bright image detected (brightness: {brightness:.1f}), using gentle enhancement")
+            else:  # Normal brightness
+                clip_limit = 2.0
+                grid_size = (8, 8)
+                print(f"📊 Normal brightness (brightness: {brightness:.1f}), using standard enhancement")
+            
+            # Apply adaptive CLAHE to L channel
+            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+            l_enhanced = clahe.apply(l)
+            
+            # Apply gamma correction if needed
+            if brightness < 70:
+                # Apply gamma correction for very dark images
+                l_enhanced = self.apply_gamma_correction(l_enhanced, gamma=1.2)
+            elif brightness > 180:
+                # Apply inverse gamma for very bright images
+                l_enhanced = self.apply_gamma_correction(l_enhanced, gamma=0.8)
+            
+            # Merge and convert back
+            enhanced = cv2.merge([l_enhanced, a, b])
+            return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        except Exception as e:
+            print(f"Enhancement error: {e}")
+            return image
+    
+    def apply_gamma_correction(self, image, gamma=1.0):
+        """Apply gamma correction to adjust image brightness"""
+        try:
+            # Build lookup table for gamma correction
+            inv_gamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+            
+            # Apply gamma correction using lookup table
+            return cv2.LUT(image, table)
+        except Exception as e:
+            print(f"Gamma correction error: {e}")
+            return image
+    
+    def extract_text_regions(self, card_image):
+        """Extract name and ID regions from card with improved layout detection"""
+        try:
+            h, w = card_image.shape[:2]
+            
+            # Ensure minimum size
+            if h < 100 or w < 100:
+                return {}
+            
+            # Photo takes up ~35% of card width on left side
+            text_start = int(w * 0.35)
+            
+            # Define regions based on TARUMT card layout
+            regions = {}
+            
+            # Strategy 1: More precise region targeting
+            # Name region (35-50% of card height) - focused on actual name position
+            name_y1 = max(0, int(h * 0.35))
+            name_y2 = min(h, int(h * 0.50))
+            name_x1 = max(0, text_start + 10)
+            name_x2 = min(w, w - 10)
+            
+            if name_y2 > name_y1 and name_x2 > name_x1:
+                regions['name'] = card_image[name_y1:name_y2, name_x1:name_x2]
+            
+            # ID region (50-65% of card height) - avoid EXPIRY DATE section
+            id_y1 = max(0, int(h * 0.50))
+            id_y2 = min(h, int(h * 0.65))
+            id_x1 = max(0, text_start + 10)
+            id_x2 = min(w, w - 10)
+            
+            if id_y2 > id_y1 and id_x2 > id_x1:
+                regions['id'] = card_image[id_y1:id_y2, id_x1:id_x2]
+            
+            # Strategy 2: Full text region (as fallback)
+            # Extract the entire text area for combined processing
+            full_text_y1 = max(0, int(h * 0.20))
+            full_text_y2 = min(h, int(h * 0.80))
+            full_text_x1 = max(0, text_start)
+            full_text_x2 = min(w, w - 10)
+            
+            if full_text_y2 > full_text_y1 and full_text_x2 > full_text_x1:
+                regions['full_text'] = card_image[full_text_y1:full_text_y2, full_text_x1:full_text_x2]
+            
+            return regions
+        except Exception as e:
+            print(f"Region extraction error: {e}")
+            return {}
+    
+    def preprocess_for_ocr(self, image, region_type='general'):
+        """Adaptive preprocessing based on region type"""
+        try:
+            # Convert to grayscale if needed
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            if region_type == 'name':
+                # For name: sophisticated processing
+                denoised = cv2.fastNlMeansDenoising(gray, h=5)
+                
+                # Use CLAHE for better contrast
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                enhanced = clahe.apply(denoised)
+                
+                # Adaptive threshold
+                binary = cv2.adaptiveThreshold(enhanced, 255, 
+                                             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                             cv2.THRESH_BINARY, 15, 3)
+                
+                # Remove small noise
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+                cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+                
+                return cleaned
+                
+            else:
+                # For ID: simpler processing
+                denoised = cv2.fastNlMeansDenoising(gray, h=10)
+                _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                return binary
+                
+        except Exception as e:
+            print(f"Preprocessing error: {e}")
+            return image
+    
+    def multi_strategy_preprocess(self, image, region_type='general'):
+        """Try multiple preprocessing strategies and return all results"""
+        strategies = []
+        
+        try:
+            # Convert to grayscale once
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image.copy()
+            
+            # Strategy 1: Standard preprocessing
+            standard = self.preprocess_for_ocr(image, region_type)
+            strategies.append(('standard', standard))
+            
+            # Strategy 2: High contrast with edge preservation
+            try:
+                # Apply bilateral filter to reduce noise while keeping edges
+                bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+                # Strong CLAHE
+                clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(4,4))
+                high_contrast = clahe.apply(bilateral)
+                strategies.append(('high_contrast', high_contrast))
+            except Exception as e:
+                print(f"High contrast strategy failed: {e}")
+            
+            # Strategy 3: Heavy denoising for very noisy images
+            try:
+                heavy_denoise = cv2.fastNlMeansDenoising(gray, h=15)
+                _, binary_denoise = cv2.threshold(heavy_denoise, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                strategies.append(('heavy_denoise', binary_denoise))
+            except Exception as e:
+                print(f"Heavy denoise strategy failed: {e}")
+            
+            # Strategy 4: Edge enhancement
+            try:
+                # Sharpen image using kernel
+                kernel = np.array([[-1,-1,-1],
+                                  [-1, 9,-1],
+                                  [-1,-1,-1]])
+                sharpened = cv2.filter2D(gray, -1, kernel)
+                _, binary_sharp = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                strategies.append(('edge_enhanced', binary_sharp))
+            except Exception as e:
+                print(f"Edge enhancement strategy failed: {e}")
+            
+            # Strategy 5: Morphological processing
+            try:
+                # Opening to remove noise, then closing to connect components
+                kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+                kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3,1))
+                
+                opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel_open)
+                closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_close)
+                _, binary_morph = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                strategies.append(('morphological', binary_morph))
+            except Exception as e:
+                print(f"Morphological strategy failed: {e}")
+            
+            print(f"📝 Prepared {len(strategies)} preprocessing strategies for OCR")
+            
+        except Exception as e:
+            print(f"Multi-strategy preprocessing error: {e}")
+            # Return at least the original image
+            strategies.append(('original', image))
+        
+        return strategies
+    
+    def clean_name_text(self, name_text):
+        """Clean and validate name text, filtering out card labels"""
+        if not name_text:
+            return None
+            
+        # Remove non-letter characters except spaces
+        cleaned = re.sub(r'[^A-Za-z\s]', '', name_text)
+        # Clean multiple spaces
+        cleaned = ' '.join(cleaned.split())
+        
+        # Split into words
+        words = cleaned.split()
+        
+        # Filter out common card labels/noise words
+        label_words = {
+            'STUDENT', 'STU', 'DEN', 'CARD', 'ID', 'IDENTITY', 'TARUC', 'TARUMT',
+            'EXPIRY', 'DATE', 'VALID', 'UNTIL', 'EXPIRES', 'COLLEGE', 'UNIVERSITY',
+            'NAME', 'MATRIC', 'NUMBER', 'NO', 'TUNKU', 'ABDUL', 'RAHMAN', 'UC',
+            'CAMPUS', 'KUALA', 'LUMPUR', 'FACULTY', 'PROGRAM', 'LEVEL', 'YEAR'
+        }
+        
+        # Remove label words and single characters (likely noise)
+        filtered_words = []
+        for word in words:
+            word_upper = word.upper()
+            # Skip label words
+            if word_upper in label_words:
+                continue
+            # Skip very short words (likely noise) except common name initials
+            if len(word) == 1 and word_upper not in ['A', 'I']:
+                continue
+            # Skip words that are clearly not names (too short or contain digits)
+            if len(word) < 2:
+                continue
+            
+            filtered_words.append(word)
+        
+        # Reconstruct name
+        cleaned = ' '.join(filtered_words)
+        
+        # STRICT validation to prevent OCR hallucination
+        if not self._is_plausible_name(cleaned):
+            print(f"❌ Rejected implausible name: '{cleaned}'")
+            return None
+        
+        # Final validation - should have at least 2 meaningful words
+        if len(filtered_words) >= 2 and len(cleaned) >= 5:
+            return cleaned.upper()
+        # Allow single long word (some compound names)
+        elif len(filtered_words) == 1 and len(filtered_words[0]) >= 6:
+            return cleaned.upper()
+        
+        return None
+    
+    def _is_plausible_name(self, name_text):
+        """Check if extracted text looks like a plausible human name"""
+        if not name_text or len(name_text) < 4:
+            return False
+        
+        words = name_text.split()
+        if len(words) == 0:
+            return False
+        
+        # Patterns that suggest OCR hallucination/garbage
+        garbage_patterns = [
+            # Single/double letters repeated
+            r'^[A-Z]{1,2}\s+[A-Z]{1,2}(\s+[A-Z]{1,2})*$',
+            # Random consonant clusters
+            r'[BCDFGHJKLMNPQRSTVWXYZ]{4,}',
+            # Too many vowels together
+            r'[AEIOU]{4,}',
+            # Words that are clearly OCR artifacts
+            r'\b(PIG|SEE|ZE|AE|EE|BEETRRNS|AIEJ|RNI|YAA|ESS)\b'
+        ]
+        
+        # Check against garbage patterns
+        for pattern in garbage_patterns:
+            if re.search(pattern, name_text.upper()):
+                return False
+        
+        # Check vowel/consonant ratio - names should have reasonable balance
+        vowels = len(re.findall(r'[AEIOU]', name_text.upper()))
+        consonants = len(re.findall(r'[BCDFGHJKLMNPQRSTVWXYZ]', name_text.upper()))
+        
+        if vowels == 0 or consonants == 0:  # No vowels or no consonants
+            return False
+        
+        # Ratio should be reasonable (not all vowels, not all consonants)
+        total_letters = vowels + consonants
+        if total_letters > 0:
+            vowel_ratio = vowels / total_letters
+            if vowel_ratio < 0.15 or vowel_ratio > 0.7:  # Too few or too many vowels
+                return False
+        
+        return True
+    
+    def smart_split_name(self, name_text):
+        """Simplified intelligent name splitting for Malaysian names"""
+        if not name_text or len(name_text) < 4:
+            return name_text
+        
+        # Common Malaysian Chinese surnames (sorted by frequency)
+        surnames = [
+            'LIEW', 'WONG', 'CHEN', 'TAN', 'LIM', 'LEE', 'ONG', 'CHAN', 'YAP', 'SIM', 
+            'GOH', 'LOW', 'WEE', 'NG', 'KOK', 'LOH', 'TEE', 'ANG', 'CHONG', 'CHUA', 
+            'FOO', 'GAN', 'LAI', 'LAM', 'LAU', 'LAW', 'LEONG', 'MOK', 'OOI', 'SOO', 
+            'TAY', 'TEH', 'TOH', 'YEE', 'YEO', 'KHOO', 'KOH', 'TEOH'
+        ]
+        
+        # English surnames for non-Chinese names
+        english_surnames = ['JOHN', 'SMITH', 'BROWN', 'JONES', 'WILSON', 'DAVIS', 'MILLER']
+        
+        all_surnames = surnames + english_surnames
+        
+        # Try to find surname
+        found_surname = None
+        remaining = ''
+        
+        for surname in all_surnames:
+            if name_text.startswith(surname):
+                found_surname = surname
+                remaining = name_text[len(surname):]
+                break
+        
+        if found_surname and remaining:
+            # Split remaining part into given names
+            parts = [found_surname]
+            
+            # Simple syllable-based splitting for given names
+            i = 0
+            while i < len(remaining):
+                # Try to make 2-3 character chunks that sound like names
+                if i + 3 <= len(remaining):
+                    # Check if 3-char chunk makes sense
+                    chunk3 = remaining[i:i+3]
+                    rest = remaining[i+3:]
+                    
+                    # Prefer 3-char if rest is empty or >=2 chars
+                    if not rest or len(rest) >= 2:
+                        parts.append(chunk3)
+                        i += 3
+                        continue
+                
+                # Try 2-char chunk
+                if i + 2 <= len(remaining):
+                    chunk2 = remaining[i:i+2]
+                    rest = remaining[i+2:]
+                    
+                    # Use 2-char if it makes sense
+                    if not rest or len(rest) >= 2:
+                        parts.append(chunk2)
+                        i += 2
+                        continue
+                
+                # Take remaining characters
+                if i < len(remaining):
+                    parts.append(remaining[i:])
+                    break
+            
+            return ' '.join(parts)
+        
+        # Fallback for names without recognized surname
+        # Try to split based on common patterns
+        if 'SMITH' in name_text:
+            # Handle "JOHNSMITH" -> "JOHN SMITH"
+            smith_pos = name_text.find('SMITH')
+            if smith_pos > 0:
+                return f"{name_text[:smith_pos]} SMITH"
+        
+        # General strategy: split into 2-3 parts
+        length = len(name_text)
+        if length <= 6:
+            # Short name: split in half
+            mid = length // 2
+            return f"{name_text[:mid]} {name_text[mid:]}"
+        elif length <= 9:
+            # Medium name: try 3-4, 2-3 pattern
+            first_part = length // 3 if length % 3 == 0 else (length + 1) // 3
+            remaining_part = name_text[first_part:]
+            if len(remaining_part) <= 5:
+                return f"{name_text[:first_part]} {remaining_part}"
+            else:
+                # Split remaining into 2 parts
+                mid = len(remaining_part) // 2
+                return f"{name_text[:first_part]} {remaining_part[:mid]} {remaining_part[mid:]}"
+        else:
+            # Long name: split into 3-4 parts
+            # Pattern: 3-3-3... or 4-3-3...
+            parts = []
+            i = 0
+            while i < length:
+                if i == 0 and length >= 10:
+                    # First part can be 4 chars for very long names
+                    chunk_size = 4
+                else:
+                    chunk_size = 3
+                
+                if i + chunk_size >= length:
+                    # Take remaining
+                    parts.append(name_text[i:])
+                    break
+                else:
+                    parts.append(name_text[i:i+chunk_size])
+                    i += chunk_size
+            
+            return ' '.join(parts)
+        
+        return name_text
+    
+    def split_merged_text(self, merged_text):
+        """Split merged name and ID text, handling cases with dates/expiry info"""
+        if not merged_text:
+            return None, None
+        
+        # Clean the text
+        text = merged_text.upper().strip()
+        text = re.sub(r'[^A-Z0-9]', '', text)
+        
+        # Look for the student ID pattern (flexible format for multiple years and programs)
+        # Supports: 19-25 + W + 2-3 letters + 4-5 digits (e.g. 24WMR12345, 23WMD12345, 21WXX9999)
+        id_pattern = r'((?:19|2[0-5])W[A-Z]{2,3}[O0]?\d{4,5})'
+        match = re.search(id_pattern, text)
+        
+        if match:
+            student_id = match.group(1)
+            id_start = match.start()
+            id_end = match.end()
+            
+            # Check if there's date/expiry info after the ID
+            # Pattern: ID + EXPIRY/DATE + numbers
+            after_id = text[id_end:]
+            if after_id:
+                # Remove common date/expiry related text after ID
+                date_patterns = [
+                    r'EXPIRY.*',
+                    r'DATE.*', 
+                    r'VALID.*',
+                    r'\d{8}.*',  # 8 digit date
+                    r'\d{6}.*',  # 6 digit date
+                    r'\d{4}.*'   # 4 digit year
+                ]
+                
+                for pattern in date_patterns:
+                    if re.match(pattern, after_id):
+                        # Truncate at the date pattern
+                        break
+            
+            # Fix common OCR mistakes in the ID
+            fixed_id = self.fix_common_ocr_mistakes(student_id)
+            
+            # Extract the name part (everything before the ID)
+            if id_start > 0:
+                name_part = text[:id_start]
+                
+                # Filter out common label words that might be mixed with name
+                # Remove STUDENT and other labels
+                name_part = re.sub(r'^(STUDENT|STU|DEN|CARD|ID)', '', name_part)
+                
+                if name_part:
+                    # Smart name splitting for Malaysian Chinese names
+                    spaced_name = self.smart_split_name(name_part)
+                    
+                    # Clean and validate the name
+                    cleaned_name = self.clean_name_text(spaced_name)
+                    if cleaned_name:
+                        return cleaned_name, fixed_id
+            
+            # If no name found before ID, return just the ID
+            return None, fixed_id
+        
+        # No ID found, treat entire text as potential name
+        # But first filter out obvious non-name content
+        name_text = text
+        
+        # Remove date patterns from potential names
+        name_text = re.sub(r'\d{6,8}', '', name_text)  # Remove 6-8 digit dates
+        name_text = re.sub(r'(EXPIRY|DATE|VALID|UNTIL).*', '', name_text)
+        
+        if name_text:
+            cleaned_name = self.clean_name_text(name_text)
+            return cleaned_name, None
+        
+        return None, None
+    
+    def _is_label_line(self, line):
+        """Check if a line contains labels/headers rather than actual data"""
+        line_upper = line.upper().strip()
+        
+        # Lines that are primarily labels
+        label_indicators = [
+            'STUDENT', 'CARD', 'IDENTITY', 'ID CARD', 'TARUC', 'TARUMT',
+            'EXPIRY DATE', 'VALID UNTIL', 'EXPIRES', 'DATE:', 'PROGRAM',
+            'FACULTY', 'CAMPUS', 'UNIVERSITY', 'COLLEGE'
+        ]
+        
+        # If line starts with or contains only label words
+        for indicator in label_indicators:
+            if line_upper.startswith(indicator) or line_upper == indicator:
+                return True
+        
+        # Lines that are mostly symbols or numbers (like dates)
+        if re.match(r'^[\d\-/:\s]+$', line_upper):
+            return True
+        
+        # Very short lines (likely fragments)
+        if len(line_upper) <= 2:
+            return True
+        
+        return False
+    
+    def _looks_like_name_line(self, line):
+        """Check if a line looks like it contains a person's name"""
+        line_clean = re.sub(r'[^A-Za-z\s]', '', line).strip()
+        
+        # Must have reasonable length
+        if len(line_clean) < 4 or len(line_clean) > 50:
+            return False
+        
+        # Should be mostly letters
+        if len(line_clean) / len(line) < 0.7:  # At least 70% letters
+            return False
+        
+        # Split into words
+        words = line_clean.split()
+        
+        # Should have 2-4 words (typical for names)
+        if len(words) < 2 or len(words) > 4:
+            return False
+        
+        # Each word should be reasonable length for names
+        for word in words:
+            if len(word) < 2 or len(word) > 15:
+                return False
+        
+        return True
+    
+    def _is_better_source(self, new_source, current_source):
+        """Check if new source is better than current source"""
+        # Priority order: full_text_parsing > dedicated_region > merged text
+        source_priority = {
+            'full_text_parsing': 3,
+            'name_region': 2, 
+            'id_region_merged': 1,
+            'full_text_merged_fallback': 1
+        }
+        
+        new_priority = source_priority.get(new_source, 0)
+        current_priority = source_priority.get(current_source, 0)
+        
+        return new_priority > current_priority
+    
+    def _select_best_name_candidate_with_source(self, candidates):
+        """Select the best name candidate considering both quality and source"""
+        if not candidates:
+            return None
+            
+        if len(candidates) == 1:
+            return candidates[0]['name']
+        
+        # Score each candidate considering quality and source
+        scored_candidates = []
+        for candidate in candidates:
+            name = candidate['name']
+            source = candidate['source']
+            
+            quality_score = self._score_name_quality(name)
+            source_bonus = self._get_source_bonus(source)
+            final_score = quality_score + source_bonus
+            
+            scored_candidates.append((final_score, name, source))
+            print(f"📄 Name candidate '{name}' from {source}: quality={quality_score}, source_bonus={source_bonus}, total={final_score}")
+        
+        # Sort by score (highest first)
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Return the highest scoring name
+        best_score, best_name, best_source = scored_candidates[0]
+        return best_name
+    
+    def _get_source_bonus(self, source):
+        """Get bonus points based on source reliability"""
+        source_bonus = {
+            'full_text_parsing': 20,  # Full text OCR usually most accurate
+            'name_region': 10,        # Dedicated name region
+            'id_region_merged': 5,    # Merged text from ID region (less reliable)
+            'full_text_merged_fallback': 0  # Fallback method
+        }
+        return source_bonus.get(source, 0)
+
+    def _select_best_name_candidate(self, name_candidates):
+        """Select the best name candidate based on quality scoring (legacy method)"""
+        if not name_candidates:
+            return None
+        
+        if len(name_candidates) == 1:
+            return name_candidates[0]
+        
+        # Score each candidate
+        scored_candidates = []
+        for name in name_candidates:
+            score = self._score_name_quality(name)
+            scored_candidates.append((score, name))
+            print(f"📄 Name candidate '{name}' scored: {score}")
+        
+        # Sort by score (highest first)
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Return the highest scoring name
+        best_score, best_name = scored_candidates[0]
+        return best_name
+    
+    def _score_name_quality(self, name):
+        """Score the quality of a name candidate (higher = better)"""
+        if not name:
+            return 0
+        
+        score = 0
+        words = name.split()
+        
+        # Base score for having reasonable word count (2-3 words ideal)
+        if 2 <= len(words) <= 3:
+            score += 50
+        elif len(words) == 4:
+            score += 30  # Still okay
+        else:
+            score -= 20  # Too few or too many words
+        
+        # Check for common Malaysian surnames (strong positive indicator)
+        common_surnames = [
+            'CHEW', 'LIEW', 'WONG', 'CHEN', 'TAN', 'LIM', 'LEE', 'ONG', 'CHAN', 'YAP',
+            'SIM', 'GOH', 'LOW', 'WEE', 'NG', 'KOK', 'LOH', 'TEE', 'ANG', 'CHUA',
+            'KHOO', 'KOH', 'LAI', 'LAU', 'TEOH', 'SMITH', 'JOHN', 'BROWN'
+        ]
+        
+        first_word = words[0] if words else ''
+        if first_word in common_surnames:
+            score += 40  # Strong boost for recognized surnames
+        
+        # Penalize names with repeated patterns (likely OCR noise)
+        if len(set(words)) < len(words) * 0.7:  # Too many repeated words
+            score -= 30
+        
+        # Check for reasonable character patterns
+        for word in words:
+            # Each word should be reasonable length
+            if 2 <= len(word) <= 10:
+                score += 5
+            else:
+                score -= 10
+            
+            # Penalize words with too many repeated characters
+            if len(set(word)) < len(word) * 0.5:  # More than 50% repeated chars
+                score -= 15
+            
+            # Penalize obvious noise patterns
+            if any(pattern in word for pattern in ['LELE', 'TETE', 'AAL', 'UTE', 'LIT']):
+                score -= 25
+        
+        # Bonus for names that sound realistic
+        if len(words) >= 2:
+            # Check if it follows typical name patterns
+            total_length = len(''.join(words))
+            if 6 <= total_length <= 20:  # Reasonable total length
+                score += 10
+        
+        # Penalize very long names (likely merged with noise)
+        if len(name) > 25:
+            score -= 20
+        
+        return score
+    
+    def fix_common_ocr_mistakes(self, text):
+        """Fix common OCR character recognition mistakes for TARUMT student IDs"""
+        if not text:
+            return None
+            
+        # Clean the text first
+        text = text.upper().strip()
+        text = re.sub(r'[^A-Z0-9]', '', text)  # Remove all non-alphanumeric
+        
+        # Special handling for TARUMT ID format (flexible years and program codes)
+        if re.search(r'(?:19|2[0-5])W[A-Z]{2,3}', text):
+            # Try to extract the ID pattern
+            # Common issue: YYWTCRO1484 should be YYWMR01484 (where YY is year, TC is program code)
+            
+            # Fix extra O issues in various program codes (supports 2-3 letter department codes)
+            text = re.sub(r'W([A-Z]{2,3})O(\d)', r'W\g<1>0\g<2>', text)  # WMRO -> WMR0, WMDO -> WMD0, etc.
+            
+            # Find the year and program code pattern
+            match = re.search(r'((?:19|2[0-5])W[A-Z]{2,3})', text)
+            if match:
+                prefix = match.group(1)  # e.g., "24WMR", "23WMD", "21WXX"
+                prefix_end = match.end()
+                
+                # Ensure the numbers after the prefix are all digits
+                remainder = text[prefix_end:]
+                # Convert common letter-to-number mistakes
+                remainder = remainder.replace('O', '0').replace('I', '1').replace('L', '1')
+                text = prefix + remainder
+        
+        # Validate the format (flexible length: 9-11 characters for different formats)
+        if 9 <= len(text) <= 11 and re.match(r'(?:19|2[0-5])W', text):
+            # Check if it matches flexible pattern
+            if re.match(r'(?:19|2[0-5])W[A-Z]{2,3}\d{4,5}', text):
+                # Extract components for validation
+                year_match = re.match(r'((?:19|2[0-5]))W([A-Z]{2,3})(\d{4,5})', text)
+                if year_match:
+                    year, program_code, digits = year_match.groups()
+                    
+                    # Basic validation: digits should be all numeric
+                    if digits.isdigit():
+                        reconstructed = f"{year}W{program_code}{digits}"
+                        return reconstructed
+        
+        # Try pattern matching with flexibility for various formats
+        patterns = [
+            # Standard formats for different years and program codes
+            (r'(?:19|2[0-5])W[A-Z]{2,3}\d{4,5}', lambda x: x),  # General format
+            (r'(?:19|2[0-5])W[A-Z]{2,3}[O0]\d{4}', lambda x: x.replace('O', '0')),  # O/0 confusion
+            # Handle extra O after department code (e.g., 24WMRO1484 -> 24WMR01484)
+            (r'((?:19|2[0-5])W[A-Z]{2,3})O(\d{4,5})', lambda x: re.sub(r'((?:19|2[0-5])W[A-Z]{2,3})O(\d{4,5})', r'\g<1>0\g<2>', x)),
+            (r'(?:19|2[0-5])\s*W\s*[A-Z]{2,3}\s*\d{4,5}', lambda x: re.sub(r'\s+', '', x)),  # Remove spaces
+        ]
+        
+        for pattern, fixer in patterns:
+            match = re.search(pattern, text)
+            if match:
+                fixed = fixer(match.group())
+                # Accept flexible length (9-11 chars) instead of fixed 10
+                if 9 <= len(fixed) <= 11 and re.match(r'(?:19|2[0-5])W[A-Z]{2,3}\d{4,5}', fixed):
+                    return fixed
+        
+        # Extended character substitutions for messy text
+        if len(text) >= 9:
+            # Common OCR mistakes mapping
+            char_map = {
+                'O': '0', 'I': '1', 'L': '1', 'S': '5', 
+                'B': '8', 'Z': '2', 'G': '6', 'q': '9'
+            }
+            
+            # Apply fixes position by position for flexible format
+            year_match = re.match(r'((?:19|2[0-5]))', text)
+            if year_match:
+                year = year_match.group(1)
+                fixed = year
+                
+                # Position after year should be W
+                pos = len(year)
+                if pos < len(text):
+                    if text[pos] not in ['W', 'w']:
+                        fixed += 'W'
+                    else:
+                        fixed += 'W'
+                    pos += 1
+                
+                # Next 2-3 positions should be program code letters
+                program_code = ''
+                while pos < len(text) and len(program_code) < 3 and text[pos].isalpha():
+                    program_code += text[pos].upper()
+                    pos += 1
+                
+                if len(program_code) >= 2:  # At least 2 letters for program code
+                    fixed += program_code
+                    
+                    # Remaining positions should be digits
+                    digit_part = ''
+                    while pos < len(text) and len(digit_part) < 5:
+                        char = text[pos]
+                        if char.isdigit():
+                            digit_part += char
+                        elif char.upper() in char_map:
+                            digit_part += char_map[char.upper()]
+                        else:
+                            # Skip unrecognized characters
+                            pass
+                        pos += 1
+                    
+                    if len(digit_part) >= 4:  # At least 4 digits
+                        final_id = fixed + digit_part
+                        if re.match(r'(?:19|2[0-5])W[A-Z]{2,3}\d{4,5}', final_id):
+                            return final_id
+        
+        return None
+    
+    def extract_student_info(self, image_region):
+        """Extract student information from card region using Tesseract"""
+        # Check Tesseract availability first
+        if not self.tesseract_available:
+            return {
+                "success": False,
+                "error": f"Tesseract not available: {self.init_error}",
+                "diagnostic_info": self.get_diagnostic_info()
+            }
+        
+        try:
+            # Validate input image
+            if image_region is None or image_region.size == 0:
+                return {
+                    "success": False,
+                    "error": "Invalid or empty image region",
+                    "diagnostic_info": self.get_diagnostic_info()
+                }
+            
+            # Check image quality - strict thresholds to prevent OCR hallucination
+            sharpness = self.calculate_sharpness(image_region)
+            print(f"📊 Image sharpness: {sharpness:.2f}")
+            
+            # Calculate brightness for quality assessment
+            if len(image_region.shape) == 3:
+                gray = cv2.cvtColor(image_region, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image_region
+            brightness = np.mean(gray)
+            print(f"📊 Image brightness: {brightness:.1f}")
+            
+            # STRICT quality thresholds to prevent hallucination
+            if sharpness < 10:
+                return {
+                    "success": False,
+                    "error": f"Image too blurry for reliable OCR (sharpness: {sharpness:.2f})",
+                    "sharpness": sharpness,
+                    "brightness": brightness,
+                    "diagnostic_info": self.get_diagnostic_info()
+                }
+            
+            if brightness < 80:
+                return {
+                    "success": False,
+                    "error": f"Image too dark for reliable OCR (brightness: {brightness:.1f})",
+                    "sharpness": sharpness,
+                    "brightness": brightness,
+                    "diagnostic_info": self.get_diagnostic_info()
+                }
+            
+            # Quality warnings for borderline images
+            confidence_multiplier = 1.0
+            sharpness_warning = None
+            
+            if sharpness < 20:
+                confidence_multiplier = 0.8
+                sharpness_warning = f"Borderline image quality (sharpness: {sharpness:.2f})"
+                print(f"⚠️ {sharpness_warning} - applying 80% confidence penalty")
+            elif sharpness < 15:
+                confidence_multiplier = 0.6
+                sharpness_warning = f"Low image quality (sharpness: {sharpness:.2f})"
+                print(f"⚠️ {sharpness_warning} - applying 60% confidence penalty")
+            
+            # Check for skew and correct if needed
+            try:
+                from utils.image_processing import detect_and_correct_text_skew
+                corrected, skew_angle = detect_and_correct_text_skew(image_region)
+                if abs(skew_angle) > 0:
+                    print(f"📐 Corrected image skew by {skew_angle:.1f}°")
+                    image_region = corrected
+            except Exception as e:
+                print(f"⚠️ Skew correction not available: {e}")
+            
+            # Enhance image
+            enhanced = self.enhance_image(image_region)
+            
+            # Extract regions
+            regions = self.extract_text_regions(enhanced)
+            print(f"📊 Extracted regions: {list(regions.keys())}")
+            
+            results = {
+                'success': False,
+                'sharpness': sharpness,
+                'name': None,
+                'student_id': None,
+                'confidence': 0.0,
+                'debug_info': {
+                    'regions_found': list(regions.keys()),
+                    'image_size': image_region.shape[:2],
+                    'enhanced': enhanced.shape[:2] if enhanced is not None else None
+                }
+            }
+            
+            # Collect all name candidates from all sources for later comparison
+            all_name_candidates = []
+            
+            # Process name region
+            if 'name' in regions and regions['name'].size > 0:
+                try:
+                    print(f"📝 Processing name region: {regions['name'].shape}")
+                    
+                    # Try direct OCR first
+                    name_text = pytesseract.image_to_string(
+                        regions['name'],
+                        config='--psm 7 -l eng'
+                    ).strip()
+                    
+                    print(f"📝 Raw name text: '{name_text}'")
+                    
+                    # Check if this contains merged text (name + ID) - flexible pattern
+                    if re.search(r'(?:19|2[0-5])W[A-Z]{2,3}', name_text.upper()):
+                        print("📝 Detected merged text in name region, splitting...")
+                        split_name, split_id = self.split_merged_text(name_text)
+                        if split_name:
+                            cleaned_name = split_name
+                            # Also save the ID if we don't have it yet
+                            if split_id and not results.get('student_id'):
+                                results['student_id'] = split_id
+                                print(f"📝 Found ID in name region: '{split_id}'")
+                        else:
+                            cleaned_name = self.clean_name_text(name_text)
+                    else:
+                        cleaned_name = self.clean_name_text(name_text)
+                    
+                    print(f"📝 Cleaned name: '{cleaned_name}'")
+                    
+                    # If failed, try preprocessing
+                    if not cleaned_name:
+                        print("📝 Trying name preprocessing...")
+                        name_processed = self.preprocess_for_ocr(regions['name'], 'name')
+                        name_text2 = pytesseract.image_to_string(
+                            name_processed,
+                            config='--psm 7 -l eng'
+                        ).strip()
+                        
+                        print(f"📝 Preprocessed name text: '{name_text2}'")
+                        
+                        # Check for merged text again (flexible pattern)
+                        if re.search(r'(?:19|2[0-5])W[A-Z]{2,3}', name_text2.upper()):
+                            split_name, split_id = self.split_merged_text(name_text2)
+                            if split_name:
+                                cleaned_name = split_name
+                                if split_id and not results.get('student_id'):
+                                    results['student_id'] = split_id
+                        else:
+                            cleaned_name2 = self.clean_name_text(name_text2)
+                            if cleaned_name2:
+                                cleaned_name = cleaned_name2
+                        
+                        print(f"📝 Final cleaned name: '{cleaned_name}'")
+                    
+                    if cleaned_name:
+                        # Add to candidates instead of immediately setting results
+                        all_name_candidates.append({
+                            'name': cleaned_name,
+                            'source': 'name_region',
+                            'raw_text': name_text,
+                            'preprocessing_used': name_text != name_text2 if 'name_text2' in locals() else False
+                        })
+                        print(f"📝 Added name candidate from region: '{cleaned_name}'")
+                        
+                except Exception as e:
+                    error_msg = f"Name OCR error: {e}"
+                    print(error_msg)
+                    results['debug_info']['name_error'] = error_msg
+            
+            # Process ID region with multi-strategy approach
+            if 'id' in regions and regions['id'].size > 0:
+                try:
+                    print(f"🆔 Processing ID region: {regions['id'].shape}")
+                    
+                    # Get multiple preprocessing strategies
+                    preprocessed_images = self.multi_strategy_preprocess(regions['id'], 'id')
+                    
+                    # Try multiple PSM modes
+                    configs = [
+                        '--psm 8 -l eng',  # Single word
+                        '--psm 7 -l eng',  # Single text line
+                        '--psm 13 -l eng', # Raw line
+                        '--psm 6 -l eng',  # Uniform block
+                    ]
+                    
+                    id_candidates = []
+                    all_results = []
+                    
+                    # Try each preprocessing strategy with each OCR config
+                    for strategy_name, processed_img in preprocessed_images:
+                        for config in configs:
+                            try:
+                                text = pytesseract.image_to_string(processed_img, config=config).strip()
+                                if text:
+                                    # Clean and normalize
+                                    cleaned = text.replace(' ', '').replace('\n', '').upper()
+                                    cleaned = re.sub(r'[^A-Z0-9]', '', cleaned)
+                                    
+                                    # Look for TARUMT ID pattern (flexible format)
+                                    if re.search(r'(?:19|2[0-5])W[A-Z]{2,3}', cleaned):
+                                        # This is likely our student ID
+                                        id_candidates.append(cleaned)
+                                        all_results.append({
+                                            'strategy': strategy_name,
+                                            'config': config,
+                                            'raw': text,
+                                            'cleaned': cleaned
+                                        })
+                                        print(f"🆔 {strategy_name} + {config}: '{cleaned}'")
+                            except Exception as e:
+                                pass  # Skip failed attempts silently
+                    
+                    # Also try direct pattern search in the original text
+                    try:
+                        # Try OCR on the original enhanced image
+                        enhanced_region = self.enhance_image(regions['id'])
+                        direct_text = pytesseract.image_to_string(enhanced_region, config='--psm 6 -l eng').strip()
+                        
+                        # Search for TARUMT ID pattern (flexible format)
+                        pattern_matches = re.findall(r'(?:19|2[0-5])W[A-Z]{2,3}[O0]?\d{4,5}', direct_text.upper())
+                        for match in pattern_matches:
+                            id_candidates.append(match)
+                            print(f"🆔 Direct pattern match: '{match}'")
+                    except:
+                        pass
+                    
+                    results['debug_info']['id_extraction'] = {
+                        'strategies_tried': len(preprocessed_images),
+                        'configs_tried': len(configs),
+                        'candidates_found': len(id_candidates),
+                        'all_results': all_results[:5]  # Limit debug info
+                    }
+                    
+                    # Process candidates to find valid ID
+                    seen = set()
+                    for candidate in id_candidates:
+                        if candidate in seen:
+                            continue
+                        seen.add(candidate)
+                        
+                        print(f"🆔 Testing candidate: '{candidate}'")
+                        
+                        # Check if this contains merged text (name + ID)
+                        if len(candidate) > 15 and not candidate.isdigit():
+                            print("🆔 Candidate might be merged text, attempting split...")
+                            split_name, split_id = self.split_merged_text(candidate)
+                            if split_id:
+                                print(f"🆔 Extracted ID from merged text: '{split_id}'")
+                                results['student_id'] = split_id
+                                # Also save the name as candidate
+                                if split_name:
+                                    all_name_candidates.append({
+                                        'name': split_name,
+                                        'source': 'id_region_merged', 
+                                        'raw_text': candidate,
+                                        'merged_with_id': True
+                                    })
+                                    print(f"🆔 Added name candidate from ID region: '{split_name}'")
+                                results['debug_info']['id_extraction']['final_id'] = split_id
+                                results['debug_info']['merged_text_split'] = True
+                                break
+                        
+                        # Normal ID fixing
+                        fixed_id = self.fix_common_ocr_mistakes(candidate)
+                        if fixed_id:
+                            print(f"🆔 Valid ID found: '{fixed_id}'")
+                            results['student_id'] = fixed_id
+                            results['debug_info']['id_extraction']['final_id'] = fixed_id
+                            break
+                    
+                    if not results.get('student_id'):
+                        print(f"🆔 No valid ID found from {len(id_candidates)} candidates")
+                    
+                except Exception as e:
+                    error_msg = f"ID OCR error: {e}"
+                    print(error_msg)
+                    results['debug_info']['id_error'] = error_msg
+            
+            # If we still don't have both name and ID, try processing the full text region
+            if (not results['name'] or not results['student_id']) and 'full_text' in regions:
+                print("📄 Trying full text region as fallback...")
+                try:
+                    full_text = pytesseract.image_to_string(
+                        regions['full_text'],
+                        config='--psm 6 -l eng'
+                    ).strip()
+                    
+                    print(f"📄 Full text OCR: '{full_text}'")
+                    
+                    # Smart line-by-line parsing
+                    lines = full_text.split('\n')
+                    name_candidates = []
+                    id_candidates = []
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        # Skip obvious label lines
+                        if self._is_label_line(line):
+                            print(f"📄 Skipping label line: '{line}'")
+                            continue
+                        
+                        # Check if line contains student ID (flexible pattern)
+                        if re.search(r'(?:19|2[0-5])W[A-Z]{2,3}', line.upper()):
+                            # Extract ID from this line
+                            _, extracted_id = self.split_merged_text(line)
+                            if extracted_id:
+                                id_candidates.append(extracted_id)
+                                print(f"📄 Found ID candidate: '{extracted_id}'")
+                        
+                        # Check if line looks like a name (no numbers, reasonable length)
+                        elif self._looks_like_name_line(line):
+                            cleaned_name = self.clean_name_text(line)
+                            if cleaned_name:
+                                name_candidates.append(cleaned_name)
+                                print(f"📄 Found name candidate: '{cleaned_name}'")
+                    
+                    # Add full_text candidates to our collection
+                    if name_candidates:
+                        for name_candidate in name_candidates:
+                            all_name_candidates.append({
+                                'name': name_candidate,
+                                'source': 'full_text_parsing',
+                                'line_based': True
+                            })
+                            print(f"📄 Added name candidate from full text: '{name_candidate}'")
+                    
+                    if id_candidates and not results['student_id']:
+                        # Pick the first valid ID
+                        results['student_id'] = id_candidates[0]
+                        print(f"📄 Selected ID from line parsing: '{id_candidates[0]}'")
+                    
+                    # Fallback: try original merged text approach for additional candidates
+                    if not results['student_id']:
+                        split_name, split_id = self.split_merged_text(full_text)
+                        
+                        if split_name:
+                            all_name_candidates.append({
+                                'name': split_name,
+                                'source': 'full_text_merged_fallback',
+                                'raw_text': full_text[:50] + '...' if len(full_text) > 50 else full_text
+                            })
+                            print(f"📄 Added fallback name candidate: '{split_name}'")
+                        
+                        if split_id:
+                            results['student_id'] = split_id
+                            print(f"📄 Fallback extracted ID: '{split_id}'")
+                        
+                except Exception as e:
+                    print(f"📄 Full text fallback error: {e}")
+            
+            # Select the best name from all candidates collected
+            if all_name_candidates:
+                print(f"🎯 Evaluating {len(all_name_candidates)} name candidates from all sources...")
+                
+                # Remove duplicates while preserving source info (improved logic)
+                unique_candidates = {}
+                for candidate in all_name_candidates:
+                    name = candidate['name']
+                    source = candidate['source']
+                    
+                    # If we haven't seen this name before, or current source is better
+                    if name not in unique_candidates or self._is_better_source(source, unique_candidates[name]['source']):
+                        unique_candidates[name] = candidate
+                
+                if unique_candidates:
+                    # Score candidates considering both quality AND source
+                    best_name = self._select_best_name_candidate_with_source(list(unique_candidates.values()))
+                    if best_name:
+                        results['name'] = best_name
+                        best_candidate_info = unique_candidates[best_name]
+                        print(f"🎯 Final selected name: '{best_name}' from source: {best_candidate_info['source']}")
+                        
+                        # Add debug info about the selection
+                        results['debug_info']['name_selection'] = {
+                            'candidates_evaluated': len(unique_candidates),
+                            'sources': [candidate['source'] for candidate in all_name_candidates],
+                            'selected_name': best_name,
+                            'selected_source': best_candidate_info['source']
+                        }
+            
+            # Calculate confidence based on what was found
+            if results['name'] and results['student_id']:
+                results['success'] = True
+                # Apply confidence multiplier from quality check
+                results['confidence'] = 0.9 * confidence_multiplier
+                print(f"✅ OCR Success: Both name and ID found (confidence: {results['confidence']:.1%})")
+            elif results['name'] or results['student_id']:
+                # Calculate partial success confidence
+                base_confidence = 0.5 * confidence_multiplier
+                
+                # STRICT confidence threshold to prevent hallucination
+                if base_confidence < 0.6:  # Require at least 60% confidence
+                    results['success'] = False
+                    results['confidence'] = base_confidence
+                    results['error'] = f"Confidence too low for reliable result ({base_confidence:.1%})"
+                    print(f"❌ OCR Rejected: Confidence below threshold ({base_confidence:.1%} < 60%)")
+                else:
+                    results['success'] = True
+                    results['confidence'] = base_confidence
+                    print(f"⚠️ OCR Partial: Found {'name' if results['name'] else 'ID'} only (confidence: {results['confidence']:.1%})")
+            else:
+                # No valid text found
+                results['success'] = False
+                results['confidence'] = 0.0
+                results['error'] = "No valid text detected from either name or ID regions"
+                print(f"❌ OCR Failed: No valid text found (confidence: {results['confidence']:.1%})")
+            
+            # Add quality warning if present
+            if sharpness_warning:
+                results['quality_warning'] = sharpness_warning
+                results['quality_multiplier'] = confidence_multiplier
+            
+            # Add summary to debug info
+            results['debug_info']['summary'] = {
+                'name_found': bool(results['name']),
+                'id_found': bool(results['student_id']),
+                'success': results['success'],
+                'confidence': results['confidence']
+            }
+                
+            return results
+            
+        except Exception as e:
+            error_msg = f"OCR processing failed: {str(e)}"
+            print(f"❌ Critical OCR error: {error_msg}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "name": None,
+                "student_id": None,
+                "confidence": 0.0,
+                "diagnostic_info": self.get_diagnostic_info(),
+                "exception_type": type(e).__name__
+            }
+    
+    def extract_with_preprocessing(self, image_region):
+        """Extract student info with automatic preprocessing (compatibility method)"""
+        # This method provides compatibility with legacy OCR interface expectations
+        return self.extract_student_info(image_region)
+    
+    def extract_from_manual_crop(self, cropped_region, enhanced_processing=True):
+        """
+        Extract student information from manually cropped region with optimized processing
+        
+        Args:
+            cropped_region: Manually cropped image region (numpy array or PIL Image)
+            enhanced_processing: Whether to apply enhanced preprocessing for manual crops
+            
+        Returns:
+            OCR result dictionary with additional metadata for manual crops
+        """
+        # Check Tesseract availability first
+        if not self.tesseract_available:
+            return {
+                "success": False,
+                "error": f"Tesseract not available: {self.init_error}",
+                "diagnostic_info": self.get_diagnostic_info(),
+                "source": "manual_crop"
+            }
+        
+        try:
+            # Handle PIL Image input
+            if hasattr(cropped_region, 'mode'):  # PIL Image
+                import numpy as np
+                cropped_region = np.array(cropped_region)
+                # Convert RGB to BGR for OpenCV processing
+                if len(cropped_region.shape) == 3 and cropped_region.shape[2] == 3:
+                    cropped_region = cv2.cvtColor(cropped_region, cv2.COLOR_RGB2BGR)
+            
+            # Validate input
+            if cropped_region is None or cropped_region.size == 0:
+                return {
+                    "success": False,
+                    "error": "Invalid or empty manually cropped region",
+                    "source": "manual_crop"
+                }
+            
+            # Calculate image quality metrics
+            sharpness = self.calculate_sharpness(cropped_region)
+            h, w = cropped_region.shape[:2]
+            
+            print(f"📊 Manual crop - Size: {w}x{h}, Sharpness: {sharpness:.2f}")
+            
+            # Enhanced quality thresholds for manual crops
+            min_sharpness_manual = 15  # Lower threshold since user selected the region
+            if sharpness < min_sharpness_manual:
+                return {
+                    "success": False,
+                    "error": f"Manually cropped region too blurry (sharpness: {sharpness:.2f}, minimum: {min_sharpness_manual})",
+                    "sharpness": sharpness,
+                    "source": "manual_crop",
+                    "suggestion": "Try selecting a sharper region or improve lighting"
+                }
+            
+            # Apply enhanced preprocessing for manual crops
+            if enhanced_processing:
+                processed_region = self.enhanced_manual_crop_preprocessing(cropped_region)
+            else:
+                processed_region = cropped_region
+            
+            results = {
+                'success': False,
+                'sharpness': sharpness,
+                'name': None,
+                'student_id': None,
+                'confidence': 0.0,
+                'source': 'manual_crop',
+                'crop_size': (w, h),
+                'debug_info': {
+                    'processing_enhanced': enhanced_processing,
+                    'image_size': cropped_region.shape[:2]
+                }
+            }
+            
+            # Try multiple OCR approaches for manual crops
+            ocr_attempts = []
+            
+            # Attempt 1: Direct OCR on processed region
+            try:
+                print("📝 Manual crop - Attempting direct OCR...")
+                text_direct = pytesseract.image_to_string(
+                    processed_region,
+                    config='--psm 6 -l eng'  # Assume uniform block of text
+                ).strip()
+                
+                ocr_attempts.append({
+                    'method': 'direct_psm6',
+                    'text': text_direct,
+                    'config': '--psm 6 -l eng'
+                })
+                
+                print(f"📝 Direct OCR result: '{text_direct}'")
+                
+            except Exception as e:
+                print(f"Direct OCR failed: {e}")
+                ocr_attempts.append({
+                    'method': 'direct_psm6',
+                    'error': str(e)
+                })
+            
+            # Attempt 2: Single text line mode
+            try:
+                print("📝 Manual crop - Attempting single line OCR...")
+                text_line = pytesseract.image_to_string(
+                    processed_region,
+                    config='--psm 7 -l eng'  # Single text line
+                ).strip()
+                
+                ocr_attempts.append({
+                    'method': 'single_line_psm7',
+                    'text': text_line,
+                    'config': '--psm 7 -l eng'
+                })
+                
+                print(f"📝 Line OCR result: '{text_line}'")
+                
+            except Exception as e:
+                print(f"Line OCR failed: {e}")
+                ocr_attempts.append({
+                    'method': 'single_line_psm7',
+                    'error': str(e)
+                })
+            
+            # Attempt 3: Raw line detection
+            try:
+                print("📝 Manual crop - Attempting raw line detection...")
+                text_raw = pytesseract.image_to_string(
+                    processed_region,
+                    config='--psm 13 -l eng'  # Raw line
+                ).strip()
+                
+                ocr_attempts.append({
+                    'method': 'raw_line_psm13',
+                    'text': text_raw,
+                    'config': '--psm 13 -l eng'
+                })
+                
+                print(f"📝 Raw OCR result: '{text_raw}'")
+                
+            except Exception as e:
+                print(f"Raw OCR failed: {e}")
+                ocr_attempts.append({
+                    'method': 'raw_line_psm13',
+                    'error': str(e)
+                })
+            
+            results['debug_info']['ocr_attempts'] = ocr_attempts
+            
+            # Process all OCR results to extract name and ID
+            all_text_results = []
+            for attempt in ocr_attempts:
+                if 'text' in attempt and attempt['text']:
+                    all_text_results.append(attempt['text'])
+            
+            print(f"📝 Manual crop - All OCR texts: {all_text_results}")
+            
+            # Extract name and ID from combined results
+            name_candidates = []
+            id_candidates = []
+            
+            for text in all_text_results:
+                if not text:
+                    continue
+                    
+                # Try to extract ID pattern
+                cleaned_text = text.replace(' ', '').replace('\n', '').upper()
+                cleaned_text = re.sub(r'[^A-Z0-9]', '', cleaned_text)
+                
+                if cleaned_text:
+                    id_candidates.append(cleaned_text)
+                    
+                # Try to extract name
+                name_text = self.clean_name_text(text)
+                if name_text:
+                    name_candidates.append(name_text)
+            
+            print(f"📝 Manual crop - Name candidates: {name_candidates}")
+            print(f"📝 Manual crop - ID candidates: {id_candidates}")
+            
+            # Find best name
+            for candidate in name_candidates:
+                if candidate:
+                    results['name'] = candidate
+                    print(f"📝 Manual crop - Selected name: '{candidate}'")
+                    break
+            
+            # Find best ID
+            for candidate in id_candidates:
+                fixed_id = self.fix_common_ocr_mistakes(candidate)
+                if fixed_id:
+                    results['student_id'] = fixed_id
+                    print(f"📝 Manual crop - Selected ID: '{fixed_id}'")
+                    break
+            
+            # Calculate confidence based on results
+            if results['name'] and results['student_id']:
+                results['success'] = True
+                results['confidence'] = 0.95  # High confidence for manual crops with both fields
+                print("✅ Manual crop OCR Success: Both name and ID found")
+            elif results['name'] or results['student_id']:
+                results['success'] = True
+                results['confidence'] = 0.7  # Medium confidence for partial results
+                print(f"⚠️ Manual crop OCR Partial: Found {'name' if results['name'] else 'ID'} only")
+            else:
+                results['error'] = "No valid text detected from manually cropped region"
+                results['suggestion'] = "Try selecting a different region with clearer text"
+                print("❌ Manual crop OCR Failed: No valid text found")
+            
+            # Add processing metadata
+            results['debug_info']['final_results'] = {
+                'name_found': bool(results['name']),
+                'id_found': bool(results['student_id']),
+                'success': results['success'],
+                'confidence': results['confidence'],
+                'total_attempts': len(ocr_attempts)
+            }
+            
+            return results
+            
+        except Exception as e:
+            error_msg = f"Manual crop OCR processing failed: {str(e)}"
+            print(f"❌ Critical manual crop OCR error: {error_msg}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "name": None,
+                "student_id": None,
+                "confidence": 0.0,
+                "source": "manual_crop",
+                "exception_type": type(e).__name__
+            }
+    
+    def enhanced_manual_crop_preprocessing(self, cropped_region):
+        """
+        Apply enhanced preprocessing specifically optimized for manually cropped regions
+        
+        Args:
+            cropped_region: Manually cropped image region
+            
+        Returns:
+            Enhanced image region ready for OCR
+        """
+        try:
+            # Convert to grayscale if needed
+            if len(cropped_region.shape) == 3:
+                gray = cv2.cvtColor(cropped_region, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = cropped_region
+            
+            # Apply stronger denoising for manual crops (user may select imperfect regions)
+            denoised = cv2.fastNlMeansDenoising(gray, h=8)
+            
+            # Enhanced contrast using CLAHE with more aggressive settings
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(denoised)
+            
+            # Adaptive thresholding optimized for text
+            binary = cv2.adaptiveThreshold(
+                enhanced, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 
+                blockSize=11,  # Smaller block size for manual crops
+                C=2
+            )
+            
+            # Morphological operations to clean up text
+            # Remove small noise
+            kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+            cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small)
+            
+            # Close gaps in characters
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3,1))
+            final = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close)
+            
+            print("📊 Manual crop preprocessing: Applied enhanced noise reduction and contrast enhancement")
+            
+            return final
+            
+        except Exception as e:
+            print(f"Manual crop preprocessing error: {e}")
+            return cropped_region  # Return original if preprocessing fails

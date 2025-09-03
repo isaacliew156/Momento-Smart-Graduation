@@ -1,0 +1,13 @@
+[
+    {
+        "student_id": "24WMR01484",
+        "name": "LIEW YI SHEN",
+        "check_in_time": "2025-09-03 20:19:30",
+        "qr_scan_time": "2025-09-03 20:19:23",
+        "face_verify_time": "2025-09-03 20:19:30",
+        "confidence_score": 79.16606140136719,
+        "verify_photo": "data/captures\\24WMR01484_20250903_201929.jpg",
+        "device_id": "Ceremony_Station_01",
+        "verification_method": "Face Recognition"
+    }
+]

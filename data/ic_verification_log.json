@@ -1,0 +1,44 @@
+[
+    {
+        "timestamp": "2025-09-02 21:47:30",
+        "success": false,
+        "student_found": true,
+        "faces_detected": 2,
+        "method": "upload"
+    },
+    {
+        "timestamp": "2025-09-03 08:03:15",
+        "success": false,
+        "student_found": true,
+        "faces_detected": 2,
+        "method": "upload"
+    },
+    {
+        "timestamp": "2025-09-03 10:43:47",
+        "success": false,
+        "student_found": true,
+        "faces_detected": 2,
+        "method": "upload"
+    },
+    {
+        "timestamp": "2025-09-03 20:08:39",
+        "success": false,
+        "student_found": true,
+        "faces_detected": 2,
+        "method": "upload"
+    },
+    {
+        "timestamp": "2025-09-03 20:14:47",
+        "success": false,
+        "student_found": false,
+        "faces_detected": 2,
+        "method": "upload"
+    },
+    {
+        "timestamp": "2025-09-03 20:15:37",
+        "success": false,
+        "student_found": true,
+        "faces_detected": 2,
+        "method": "upload"
+    }
+]
